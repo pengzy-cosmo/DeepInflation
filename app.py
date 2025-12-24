@@ -20,7 +20,7 @@ load_dotenv()
 def create_agent_interface():
     """Create Gradio Blocks interface with streaming and custom API settings."""
 
-    def initialize_agent(agent_state: dict, api_key: str, base_url: str, model: str, embedding_model: str) -> tuple:
+    def initialize_agent(agent_state: dict, api_key: str, base_url: str, model: str, embedding_model: str, image_model: str) -> tuple:
         """Initialize agent with custom settings."""
         try:
             if not api_key.strip():
@@ -31,6 +31,7 @@ def create_agent_interface():
             base_url = base_url.strip() or os.getenv("BASE_URL") or None
             model = model.strip() or "gpt-5.2"
             embedding_model = embedding_model.strip() or "text-embedding-3-small"
+            image_model = image_model.strip() or "dall-e-3"
 
             agent_state = {
                 "agent": DeepInflation(
@@ -38,6 +39,7 @@ def create_agent_interface():
                     base_url=base_url,
                     model=model,
                     embedding_model=embedding_model,
+                    image_model=image_model,
                     verbose=True,
                 )
             }
@@ -59,10 +61,18 @@ def create_agent_interface():
         if tool_name == "delegate_task_to_member":
             return f"**Task**: {args.get('task', '')}"
 
-        if tool_name in ("analyze_potential", "plot_potential"):
-            text = f"**Expression**: `{args.get('expression', '')}`"
-            if args.get("output_path"):
-                text += f"\n**Output**: `{args['output_path']}`"
+        if tool_name in ("analyze_potential", "plot_potential", "generate_schematic"):
+            if tool_name == "generate_schematic":
+                text = f"**Prompt**: `{args.get('prompt', '')}`"
+            else:
+                text = f"**Expression**: `{args.get('expression', '')}`"
+            
+            if args.get("output_path") or args.get("plot_path"):
+                # Handle inconsistent arg names if necessary, but usually args has input args.
+                # Actually, args dict here comes from tool_args which is INPUT args.
+                # Output path is usually returned in result, not args, for these tools (unless passed as arg).
+                # But for display purposes, we just show input args.
+                pass
             return text
 
         if tool_name == "search_potential":
@@ -260,7 +270,8 @@ Ask about specific potentials, observational constraints, or let me search for m
                         type="password",
                         value="",
                     )
-                    model_input = gr.Textbox(label="Model", placeholder="gpt-5.2", value="gpt-5.2")
+                    model_input = gr.Textbox(label="Chat Model", placeholder="gpt-5.2", value="gpt-5.2")
+                    image_model_input = gr.Textbox(label="Image Model", placeholder="gpt-image-1", value="gpt-image-1")
                     embedding_model_input = gr.Textbox(
                         label="Embedding Model",
                         placeholder="text-embedding-3-small",
@@ -291,7 +302,7 @@ Ask about specific potentials, observational constraints, or let me search for m
 
         # Plot output
         plot_output = gr.Image(
-            label="📊 Generated Plot",
+            label="Visualization",
             type="filepath",
             interactive=False,
             height=380,
@@ -307,6 +318,7 @@ Ask about specific potentials, observational constraints, or let me search for m
                 base_url_input,
                 model_input,
                 embedding_model_input,
+                image_model_input,
             ],
             outputs=[agent_state, status_output, chatbot, plot_output],
         )

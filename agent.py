@@ -14,7 +14,7 @@ from agno.team import Team
 
 from encyclopedia_rag import EncyclopediaRAG
 from sr_search import search_potential
-from tools import analyze_potential, plot_potential
+from tools import analyze_potential, plot_potential, generate_schematic
 
 # ============================================================================
 # System Prompts
@@ -36,17 +36,17 @@ MAIN_AGENT_PROMPT = r"""You are an expert inflation cosmology assistant speciali
 **Input**: the task based on user's request (target observables, potential characteristics, constraints and time budget).
 **Output**: Config summary and ranked candidates with expressions and predictions.
 
+## Plotting Agent
+**Visualization Expert**. Delegate all image generation tasks here.
+**Delegate when**: User asks for plots, graphs, illustrations, or schematic images.
+**Input**: Precise description of what to visualize (either a physics potential for plotting, or a conceptual description).
+
 # TOOLS
 
 ## analyze_potential(expression)
 Compute inflation observables (ns, r, A_s) for all valid trajectories of V(φ).
 **Expression format**: Only 'phi' variable + numeric values (e.g., 'phi^2', '(1-exp(-0.816*phi))^2')
 **Invalid**: Symbolic parameters like 'M*phi^2', 'V0*phi^2'
-
-## plot_potential(expression, output_path)
-Generate 3-panel diagnostic plot: V(φ) with trajectories | ε,η vs φ | ns-r vs Planck+BK18
-**Expression format**: Same as analyze_potential
-**Returns**: Absolute file path
 
 ## search_knowledge_base (built-in)
 Search Encyclopædia Inflationaris using hybrid retrieval (semantic + keyword).
@@ -59,7 +59,7 @@ Search Encyclopædia Inflationaris using hybrid retrieval (semantic + keyword).
 - The final answer should be concise and relevant.
 - Use proper Markdown commands with $...$ for math.
 - Always base the final answer on tool results, not assumptions. Do not invent data.
-- For PLOTTING, provide file path to saved image.
+- Plots and images will be handled by the Plotting Agent; you just confirm they were generated.
 """
 
 SR_AGENT_PROMPT = r"""You are a symbolic regression expert for inflation cosmology.
@@ -73,97 +73,35 @@ Note that you should run the `search_potential` tool once at a time, and return 
 4. **Return** both the config summary and the search results
 
 # SYMBOLIC REGRESSION (PYSR) CONFIG
+(See tool documentation for details)
+"""
 
-Construct `config_json` based on user's physics goals and computational budget.
+PLOTTING_AGENT_PROMPT = r"""You are a Scientific Visualization Expert for Inflation Cosmology.
+Your goal is to choose the best visualization method for the user's request: **Physics Plot** vs **Conceptual Schematic**.
 
-## Physics Targets
-The scalar spectral index (ns), the tensor-to-scalar ratio (r), and number of e-folds (N_obs) to guide the search.
-**ns_target**, **ns_sigma**, **r_target**, **r_sigma**, **N_obs** 
-- Defaults: ns=0.9649±0.0042, r=0.0±0.014, N_obs=60
-- set r_target = 0 if no detection of tensor modes is desired
-- Adjust sigma to control tolerance (widen for exploration, tighten for precision)
+# DECISION LOGIC
 
-## Operator Selection (defines search space)
+1. **Physics-based Plotting** (`plot_potential`)
+   - **Use when**: User asks to plot a specific inflation potential V(phi) or wants quantitative data (slow-roll parameters, ns-r constraints).
+   - **Requirement**: You must have a computable mathematical expression for V(phi) involving only `phi` and numbers (e.g., `phi^2`, `(1-exp(-sqrt(2/3)*phi))^2`).
+   - **Configuration**:
+     - Analyze if the user wants specific panels (e.g., "show me the potential", "show constraints").
+     - If not specified, default to ALL panels.
+     - Pass `panels` list to the tool: `['potential']`, `['slow_roll']`, `['constraints']`, or combination.
 
-Choose operators based on expected physics. Each additional operator increases search complexity.
+2. **Conceptual/Schematic Art** (`generate_schematic`)
+   - **Use when**:
+     - User asks for "illustration", "artistic view", "cartoon", "concept".
+     - The request is abstract (e.g., "draw the multiverse", "show inflation stability").
+     - The potential is too complex for the numerical solver or symbolic (e.g., has undefined constants `V0`, `lambda`).
+   - **Action**: Create a detailed, high-quality prompt for DALL-E describing the physical concept in an artistic way.
 
-**binary_operators** (must provide): Available `["+", "-", "*", "/", "^"]`
-**unary_operators** (default `[]`): Available `["exp", "log", "sqrt", "sin", "cos", "square", "cube", "neg", "tanh]`
+# FAILURE RECOVERY
+- If `plot_potential` fails (e.g., due to solver error), catch the error and FALLBACK to `generate_schematic` to provide at least a visual aid, explaining that the numeric plot failed.
 
-**Selection strategy**: Start simple, add complexity only as needed
-- Always include ["+", "*"] for basic forms
-- Include either `^` or ['square', 'cube'] for polynomial terms (not both)
-- Be cautious with "/", "tanh", "sin", "cos", include only if necessary
-
-## Complexity Control (guides search efficiency and interpretability)
-
-**maxsize**: Expression tree size limit (typical: 12-30)
-- Lower → simpler, faster; Higher → more expressive
-
-**constraints**: `{operator: [arg1_max, arg2_max]}` or `{operator: max_complexity}` (use -1 for no limit)
-- **Use JSON array syntax `[a, b]` for tuple constraints** (automatically converted to tuples)
-- Example: `{"^": [-1, 1]}` limits exponent to constants, prevents `phi^(exp(x))`
-- Example: `{"/": [-1, 3]}` allows any complexity numerator, max 3 denominator
-- Use to avoid pathological forms (variable exponents, deep fractions)
-
-**nested_constraints**: `{outer_op: {inner_op: max_depth}}`
-- Example: `{"exp": {"exp": 0}}` prevents `exp(exp(x))`
-- Example: `{"exp": {"log": 0}}` prevents `exp(log(x))`
-- Use to forbid unphysical compositions
-
-**complexity_of_operators**: `{operator: cost}` (default: 1 for all)
-- Example: `{"exp": 3, "^": 2}` biases toward polynomials
-- Use to prefer simpler functional forms
-
-### Configuration Principles
-
-- Constraints must only reference operators you included in binary_operators/unary_operators.
-- Always constrain `^` exponents: `{"^": [-1, 1]}` when using `^`; Always constrain `/` denominators when using `/`: `{"/": [-1, 3]}`
-- Always limit nested complex ops, e.g. `{"exp": {"exp": 0}}`; Always prevent inappropriate nesting (e.g. `{"exp": {"log": 0}}`)
-
-## Evolution Parameters (controls search effort)
-
-**populations**: Parallel search populations (typical: 15-50, default: 31)
-**niterations**: Evolution cycles (typical: 20-60, default: 40)
-**population_size**: Individuals per population (default: 27, usually sufficient)
-
-Adjust based on time budget: quick (<1min), balanced (1-3min), thorough (5-10min)
-
-## Example Config
-```json
-{
-  "ns_target": 0.9649,
-  "ns_sigma": 0.0042,
-  "r_target": 0.0,
-  "r_sigma": 0.014,
-  "N_obs": 60.0,
-  "binary_operators": ["+", "*", "^"],
-  "unary_operators": ["exp"],
-  "constraints": {"^": [-1, 1]},
-  "nested_constraints": {"exp": {"exp": 0}},
-  "maxsize": 15,
-  "populations": 25,
-  "niterations": 35
-}
-```
-This is just an example. Adapt operators/constraints/targets to actual physics requirements. (Do not copy blindly.)
-
-# SR RESULT POST-PROCESSING
-
-When `search_potential` returns multiple candidates:
-- Select top 3-10: Prioritize lowest loss + interpretability + structural diversity.
-- Simplify: Round coefficients, apply algebraic simplification (conservatively), identify duplicates
-- Present the final results as described below.
-
-# OUTPUT FORMAT
-
-Return in this format:
-```
-**Search Config**: ns={ns_target}±{ns_sigma}, r={r_target}±{r_sigma}, N_obs={N_obs}, ... [operators, constraints summary]
-
-**Results**:
-{search_potential output}
-```
+# OUTPUT
+- perform the tool call.
+- Return the file path of the generated image.
 """
 
 
@@ -175,6 +113,7 @@ Return in this format:
 TOOL_DISPLAY_CONFIG = {
     "analyze_potential": ("🔬", "Analyzing", False),
     "plot_potential": ("📊", "Plotting", False),
+    "generate_schematic": ("🎨", "Generating Image", True),
     "search_knowledge_base": ("📚", "Encyclopedia", False),
     "search_potential": ("🧬", "Symbolic Regression", True),
 }
@@ -188,6 +127,10 @@ def _format_tool_info(tool_name: str, args: dict) -> dict:
 
     emoji, title, long_running = TOOL_DISPLAY_CONFIG.get(tool_name, ("🔧", tool_name, False))
     result = {"tool_name": tool_name, "title": f"{emoji} {title}", "log": ""}
+    
+    if tool_name == "generate_schematic":
+         result["log"] = f"Prompt: {args.get('prompt', '')[:50]}..."
+         
     if long_running:
         result["long_running"] = True
     return result
@@ -230,6 +173,7 @@ class DeepInflation:
         base_url: str | None = None,
         model: str = "gpt-5.2",
         embedding_model: str = "text-embedding-3-small",
+        image_model: str = "dall-e-3",
         temperature: float = 1.0,
         verbose: bool = True,
     ):
@@ -260,9 +204,10 @@ class DeepInflation:
         import tools as tools_module
 
         tools_module.VERBOSE = encyclopedia_rag.VERBOSE = verbose
+        tools_module.IMAGE_MODEL = image_model
 
         if verbose:
-            print(f"[Agent] Initializing with model={model}, base_url={self._base_url or 'default'}")
+            print(f"[Agent] Initializing with model={model}, image_model={image_model}, base_url={self._base_url or 'default'}")
 
         # Session state
         self.session_id = str(uuid4())
@@ -270,7 +215,9 @@ class DeepInflation:
         self.team = self._create_team()
 
     def _create_team(self) -> Team:
-        """Create Agno Team with SR sub-agent."""
+        """Create Agno Team with SR and Plotting sub-agents."""
+        
+        # 1. Symbolic Regression Sub-Agent
         sr_agent = Agent(
             name="SR Agent",
             model=self._model,
@@ -281,11 +228,24 @@ class DeepInflation:
             num_history_runs=3,
             markdown=True,
         )
+        
+        # 2. Plotting Sub-Agent (New)
+        plotting_agent = Agent(
+            name="Plotting Agent",
+            model=self._model,
+            role="Visualize physics concepts via plots or schematic art",
+            instructions=PLOTTING_AGENT_PROMPT,
+            tools=[plot_potential, generate_schematic],
+            add_history_to_context=True,
+            num_history_runs=2,
+            markdown=True,
+        )
+
         return Team(
             name="Inflation Research Team",
             model=self._model,
-            members=[sr_agent],
-            tools=[analyze_potential, plot_potential],
+            members=[sr_agent, plotting_agent],
+            tools=[analyze_potential],  # Note: plot_potential moved to sub-agent
             instructions=MAIN_AGENT_PROMPT,
             show_members_responses=True,
             markdown=True,
@@ -386,7 +346,7 @@ class DeepInflation:
                         }
 
                         # Extract plot path on success
-                        if tool_name == "plot_potential" and isinstance(output, dict) and output.get("success"):
+                        if tool_name in ("plot_potential", "generate_schematic") and isinstance(output, dict) and output.get("success"):
                             path = output.get("plot_path")
                             if path and os.path.exists(path):
                                 self.last_plot_path = path
