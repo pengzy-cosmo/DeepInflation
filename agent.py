@@ -73,7 +73,97 @@ Note that you should run the `search_potential` tool once at a time, and return 
 4. **Return** both the config summary and the search results
 
 # SYMBOLIC REGRESSION (PYSR) CONFIG
-(See tool documentation for details)
+
+Construct `config_json` based on user's physics goals and computational budget.
+
+## Physics Targets
+The scalar spectral index (ns), the tensor-to-scalar ratio (r), and number of e-folds (N_obs) to guide the search.
+**ns_target**, **ns_sigma**, **r_target**, **r_sigma**, **N_obs** 
+- Defaults: ns=0.9649±0.0042, r=0.0±0.014, N_obs=60
+- set r_target = 0 if no detection of tensor modes is desired
+- Adjust sigma to control tolerance (widen for exploration, tighten for precision)
+
+## Operator Selection (defines search space)
+
+Choose operators based on expected physics. Each additional operator increases search complexity.
+
+**binary_operators** (must provide): Available `["+", "-", "*", "/", "^"]`
+**unary_operators** (default `[]`): Available `["exp", "log", "sqrt", "sin", "cos", "square", "cube", "neg", "tanh]`
+
+**Selection strategy**: Start simple, add complexity only as needed
+- Always include ["+", "*"] for basic forms
+- Include either `^` or ['square', 'cube'] for polynomial terms (not both)
+- Be cautious with "/", "tanh", "sin", "cos", include only if necessary
+
+## Complexity Control (guides search efficiency and interpretability)
+
+**maxsize**: Expression tree size limit (typical: 12-30)
+- Lower → simpler, faster; Higher → more expressive
+
+**constraints**: `{operator: [arg1_max, arg2_max]}` or `{operator: max_complexity}` (use -1 for no limit)
+- **Use JSON array syntax `[a, b]` for tuple constraints** (automatically converted to tuples)
+- Example: `{"^": [-1, 1]}` limits exponent to constants, prevents `phi^(exp(x))`
+- Example: `{"/": [-1, 3]}` allows any complexity numerator, max 3 denominator
+- Use to avoid pathological forms (variable exponents, deep fractions)
+
+**nested_constraints**: `{outer_op: {inner_op: max_depth}}`
+- Example: `{"exp": {"exp": 0}}` prevents `exp(exp(x))`
+- Example: `{"exp": {"log": 0}}` prevents `exp(log(x))`
+- Use to forbid unphysical compositions
+
+**complexity_of_operators**: `{operator: cost}` (default: 1 for all)
+- Example: `{"exp": 3, "^": 2}` biases toward polynomials
+- Use to prefer simpler functional forms
+
+### Configuration Principles
+
+- Constraints must only reference operators you included in binary_operators/unary_operators.
+- Always constrain `^` exponents: `{"^": [-1, 1]}` when using `^`; Always constrain `/` denominators when using `/`: `{"/": [-1, 3]}`
+- Always limit nested complex ops, e.g. `{"exp": {"exp": 0}}`; Always prevent inappropriate nesting (e.g. `{"exp": {"log": 0}}`)
+
+## Evolution Parameters (controls search effort)
+
+**populations**: Parallel search populations (typical: 15-50, default: 31)
+**niterations**: Evolution cycles (typical: 20-60, default: 40)
+**population_size**: Individuals per population (default: 27, usually sufficient)
+
+Adjust based on time budget: quick (<1min), balanced (1-3min), thorough (5-10min)
+
+## Example Config
+```json
+{
+  "ns_target": 0.9649,
+  "ns_sigma": 0.0042,
+  "r_target": 0.0,
+  "r_sigma": 0.014,
+  "N_obs": 60.0,
+  "binary_operators": ["+", "*", "^"],
+  "unary_operators": ["exp"],
+  "constraints": {"^": [-1, 1]},
+  "nested_constraints": {"exp": {"exp": 0}},
+  "maxsize": 15,
+  "populations": 25,
+  "niterations": 35
+}
+```
+This is just an example. Adapt operators/constraints/targets to actual physics requirements. (Do not copy blindly.)
+
+# SR RESULT POST-PROCESSING
+
+When `search_potential` returns multiple candidates:
+- Select top 3-10: Prioritize lowest loss + interpretability + structural diversity.
+- Simplify: Round coefficients, apply algebraic simplification (conservatively), identify duplicates
+- Present the final results as described below.
+
+# OUTPUT FORMAT
+
+Return in this format:
+```
+**Search Config**: ns={ns_target}±{ns_sigma}, r={r_target}±{r_sigma}, N_obs={N_obs}, ... [operators, constraints summary]
+
+**Results**:
+{search_potential output}
+```
 """
 
 PLOTTING_AGENT_PROMPT = r"""You are a Scientific Visualization Expert for Inflation Cosmology.
