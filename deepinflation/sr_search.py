@@ -27,13 +27,17 @@ using Roots, Interpolations, OrdinaryDiffEq
 using Logging: disable_logging, Warn
 disable_logging(Warn)
 
-# =============================================================================
+# -----------------------------
 # Constants
-# =============================================================================
+# -----------------------------
 
 const T = Float64
 const M_P2 = T(1.0)
 const SMALL = T(1e-30)
+
+const EPS_EQ_TOL = T(1e-3)          # |epsilon(phi) - 1| tolerance for accepting roots
+const ROOT_XRTOL = T(1e-6)          # root refinement tolerance (bisection)
+const ROOT_DEDUP_TOL = T(1e-6)      # dedup tolerance for close roots
 
 const NS_OBS = T({ns_target})
 const NS_SIGMA = T({ns_sigma})
@@ -41,9 +45,9 @@ const R_OBS = T({r_target})
 const R_SIGMA = T({r_sigma})
 const N_OBS = T({N_obs})
 
-# =============================================================================
-# Slow-roll Parameters
-# =============================================================================
+# -----------------------------
+# Slow-roll parameters
+# -----------------------------
 
 """ε = (M_P²/2)(V'/V)²"""
 function epsilon(V, V_prime, phi, phi_min, phi_max)
@@ -61,9 +65,9 @@ function epsilon_derivative(V, V_prime, V_double_prime, phi, phi_min, phi_max)
     return M_P2 * (V_p / V_val) * ((V_pp * V_val - V_p^2) / V_val^2)
 end
 
-# =============================================================================
-# E-folds Integration
-# =============================================================================
+# -----------------------------
+# E-fold integration
+# -----------------------------
 
 """Find φ_N by integrating dφ/dN = M_P² V'/V backwards from φ_end."""
 function find_phi_N(V, V_prime, phi_end, bound)
@@ -93,19 +97,83 @@ function find_phi_N(V, V_prime, phi_end, bound)
     end
 end
 
-# =============================================================================
-# Observable Computation
-# =============================================================================
+# -----------------------------
+# Root finding (epsilon = 1)
+# -----------------------------
+
+"""
+Find inflation endpoints where ε(φ) = 1 within [phi_min, phi_max] using
+grid-bracketing + bisection (avoids `find_zeros` numerical instability).
+"""
+function find_inflation_endpoints(V, V_prime, phi_min, phi_max; ngrid::Int=256)
+    epsilon_eq(phi) = epsilon(V, V_prime, phi, phi_min, phi_max) - T(1.0)
+
+    phis = range(phi_min, phi_max; length=ngrid)
+    roots = T[]
+
+    phi_prev = first(phis)
+    f_prev = try
+        epsilon_eq(phi_prev)
+    catch
+        oftype(phi_prev, NaN)
+    end
+    if isfinite(f_prev) && iszero(f_prev)
+        push!(roots, phi_prev)
+    end
+
+    for i in 2:length(phis)
+        phi = phis[i]
+        f = try
+            epsilon_eq(phi)
+        catch
+            oftype(phi, NaN)
+        end
+
+        if isfinite(f_prev) && isfinite(f)
+            if iszero(f)
+                push!(roots, phi)
+            elseif f_prev * f < 0
+                root = try
+                    find_zero(epsilon_eq, (phi_prev, phi), Bisection(); xrtol=ROOT_XRTOL)
+                catch
+                    nothing
+                end
+
+                if !(root isa Nothing) && isfinite(root) && (phi_min < root < phi_max)
+                    fr = try
+                        epsilon_eq(root)
+                    catch
+                        oftype(root, NaN)
+                    end
+                    if isfinite(fr) && abs(fr) <= EPS_EQ_TOL
+                        push!(roots, root)
+                    end
+                end
+            end
+        end
+
+        phi_prev, f_prev = phi, f
+    end
+
+    isempty(roots) && return roots
+
+    sort!(roots)
+    dedup = T[]
+    for r in roots
+        if isempty(dedup) || abs(r - last(dedup)) > ROOT_DEDUP_TOL
+            push!(dedup, r)
+        end
+    end
+    return dedup
+end
+
+# -----------------------------
+# Observables (ns, r)
+# -----------------------------
 
 """Find all valid inflation trajectories and compute (ns, r) for each."""
 function compute_observables(V, V_prime, V_double_prime, phi_min, phi_max)
-    # Find ε = 1 points
-    epsilon_eq(phi) = epsilon(V, V_prime, phi, phi_min, phi_max) - 1.0
-    phi_ends = try
-        find_zeros(epsilon_eq, phi_min, phi_max; naive=true, tol=1e-3)
-    catch
-        T[]
-    end
+    phi_ends = find_inflation_endpoints(V, V_prime, phi_min, phi_max; ngrid=256)
     isempty(phi_ends) && return Tuple{{T,T}}[]
 
     results = Tuple{{T,T}}[]
@@ -127,6 +195,10 @@ function compute_observables(V, V_prime, V_double_prime, phi_min, phi_max)
         direction * (phi_N - phi_end) <= 0 && continue
         direction * V_prime(phi_N) <= 0 && continue
         direction * epsilon_derivative(V, V_prime, V_double_prime, phi_N, phi_min, phi_max) >= 0 && continue
+        # Trajectory should not cross another ε=1 point between φ_end and φ_N.
+        a, b = minmax(phi_N, phi_end)
+        has_crossing = any(pe -> (a < pe < b) && (abs(pe - phi_end) > T(1e-9)), phi_ends)
+        has_crossing && continue
 
         # Compute observables
         eps_N = epsilon(V, V_prime, phi_N, phi_min, phi_max)
@@ -155,9 +227,21 @@ function compute_min_chi2(obs_list)
     return min_chi2, best_obs
 end
 
-# =============================================================================
-# PySR Loss Function
-# =============================================================================
+# -----------------------------
+# Spline helpers
+# -----------------------------
+
+function make_spline(phis, values)
+    itp = cubic_spline_interpolation(phis, values; extrapolation_bc=Line())
+    V(phi) = itp(phi)
+    V_prime(phi) = Interpolations.gradient(itp, phi)[1]
+    V_double_prime(phi) = Interpolations.hessian(itp, phi)[1]
+    return V, V_prime, V_double_prime
+end
+
+# -----------------------------
+# PySR loss function
+# -----------------------------
 
 """PySR loss: χ²/2 with numerical stability penalty."""
 function compute_loss_julia(tree, dataset::Dataset{{T,L}}, options) where {{T,L}}
@@ -169,10 +253,7 @@ function compute_loss_julia(tree, dataset::Dataset{{T,L}}, options) where {{T,L}
     phis = range(phi_min, phi_max; length=length(phi_grid))
 
     try
-        itp = cubic_spline_interpolation(phis, prediction; extrapolation_bc=Line())
-        V(phi) = itp(phi)
-        V_prime(phi) = Interpolations.gradient(itp, phi)[1]
-        V_double_prime(phi) = Interpolations.hessian(itp, phi)[1]
+        V, V_prime, V_double_prime = make_spline(phis, prediction)
 
         obs_list = compute_observables(V, V_prime, V_double_prime, phi_min, phi_max)
         chi2, best_obs = compute_min_chi2(obs_list)
@@ -184,10 +265,7 @@ function compute_loss_julia(tree, dataset::Dataset{{T,L}}, options) where {{T,L}
             pred_c = prediction[1:2:end]
             phi_min_c, phi_max_c = first(phis_c), last(phis_c)
 
-            itp_c = cubic_spline_interpolation(phis_c, pred_c; extrapolation_bc=Line())
-            V_c(phi) = itp_c(phi)
-            V_prime_c(phi) = Interpolations.gradient(itp_c, phi)[1]
-            V_double_prime_c(phi) = Interpolations.hessian(itp_c, phi)[1]
+            V_c, V_prime_c, V_double_prime_c = make_spline(phis_c, pred_c)
 
             obs_c = compute_observables(V_c, V_prime_c, V_double_prime_c, phi_min_c, phi_max_c)
             chi2_c, best_obs_c = compute_min_chi2(obs_c)
