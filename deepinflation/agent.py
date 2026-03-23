@@ -1,16 +1,13 @@
-"""Inflation Research Agent - Agno Framework Implementation"""
+"""Inflation research agent with a small handwritten agent loop."""
 
 import json
 import os
+import sqlite3
 import time
+from pathlib import Path
 from uuid import uuid4
 
-from agno.agent import Agent
-from agno.db.sqlite import SqliteDb
-from agno.models.openai.like import OpenAILike
-from agno.run.agent import RunEvent
-from agno.run.team import TeamRunEvent
-from agno.team import Team
+from openai import AsyncOpenAI
 
 from .encyclopedia_rag import init_rag, search_encyclopedia
 from .sr_search import search_potential
@@ -36,8 +33,8 @@ User Request
 ├─ "What is ns/r for V = ...?" → analyze_potential
 ├─ "Plot/show/visualize V = ..." → plot_potential
 ├─ "What is [model name]?" / "Explain [concept]" → search_encyclopedia
-├─ "Find/discover potential with ns≈.../r<..." → DELEGATE to SR Agent
-└─ "Find models compatible with Planck data" → DELEGATE to SR Agent
+├─ "Find/discover potential with ns≈.../r<..." → delegate to SR Agent
+└─ "Find models compatible with Planck data" → delegate to SR Agent
 ```
 
 # DELEGATION (SR Agent)
@@ -71,6 +68,12 @@ Query Encyclopædia Inflationaris (100+ inflation models).
 - **Returns**: Full model documentation including potential forms and theoretical background
 - **Citation required**: When using information from this tool, cite the source
 
+## run_sr_agent(task)
+Delegate the task to the dedicated SR Agent.
+- **Use for**: Searching or discovering potentials from target observables or constraints
+- **Input**: A concise task description in plain English
+- **Returns**: Search config summary + ranked candidates
+
 # OUTPUT PRINCIPLES
 
 - Focus on answering the user's question; be concise and relevant.
@@ -84,20 +87,20 @@ Query Encyclopædia Inflationaris (100+ inflation models).
 
 If SR Agent returns no valid candidates:
 1. **Analyze** the failure: constraints too tight? search space too narrow? targets unrealistic?
-2. **Retry** with adjusted config: relax sigma, add operators, increase iterations
-3. **If still fails**, explain to user: what was attempted, why it failed, suggest alternatives
+2. **Explain** clearly what was attempted and why it failed
+3. **Suggest** a reasonable next step
 """
 
 SR_AGENT_PROMPT = r"""You are a symbolic regression specialist. Your job is to configure and run PySR searches to discover inflation potentials V(φ) matching target observables.
 
 # WORKFLOW
 
-1. **Interpret** the delegation from main agent → extract physics goals (target ns, r, constraints, time budget)
+1. **Interpret** the delegated task → extract physics goals (target ns, r, constraints, time budget)
 2. **Configure** PySR parameters following the guide below
 3. **Run** `search_potential` with your config JSON
 4. **Return** config summary + ranked results immediately
 
-Note: Run `search_potential` ONLY ONCE per delegation.
+Note: Run `search_potential` ONLY ONCE per task.
 
 # PYSR CONFIG REFERENCE
 
@@ -107,7 +110,7 @@ Construct `config_json` based on physics goals and time budget.
 
 - **ns_target** (default 0.9649): Target scalar spectral index
 - **ns_sigma** (default 0.0042): Tolerance for ns (widen for exploration, tighten for precision)
-- **r_target** (default 0.0): Target tensor-to-scalar ratio (keep 0.0 if no detection is requested) )
+- **r_target** (default 0.0): Target tensor-to-scalar ratio
 - **r_sigma** (default 0.014): Tolerance for r
 - **N_obs** (default 60.0): Number of e-folds at horizon crossing
 
@@ -120,7 +123,7 @@ Principles:
 - Always include `["+", "*"]` as base
 - Use either `^` OR `["square", "cube"]` for powers (not both)
 - Start with common operators like `["+", "*", "^"]` or `["+", "*", "^", "exp"]`
-- `tanh` and other exotic operators: include only when specifically needed, and assign higher complexity cost (see complexity_of_operators)
+- `tanh` and other exotic operators: include only when specifically needed, and assign higher complexity cost
 - Each additional operator increases search space; balance expressiveness vs efficiency
 
 ## Complexity Control
@@ -130,27 +133,23 @@ Principles:
 
 **constraints**: Limit operator argument complexity
 - Format: `{operator: [arg1_max, arg2_max]}` or `{operator: max_complexity}`
-- Use JSON array `[a, b]` for tuple constraints (auto-converted)
-- Example: `{"^": [-1, 1]}` allows any base complexity, limits exponent to complexity 1 (constant or single variable)
-- Example: `{"/": [-1, 3]}` allows any numerator, limits denominator complexity to 3
+- Use JSON array `[a, b]` for tuple constraints
+- Example: `{"^": [-1, 1]}` limits exponent complexity to 1
+- Example: `{"/": [-1, 3]}` limits denominator complexity to 3
 
 **nested_constraints**: Forbid operator nesting
 - Format: `{outer_op: {inner_op: max_depth}}`
 - Example: `{"exp": {"exp": 0}}` prevents `exp(exp(x))`
-- Example: `{"exp": {"log": 0}}` prevents `exp(log(x))`
 
 **complexity_of_operators**: Assign cost to operators (default: 1)
 - Example: `{"exp": 2, "tanh": 4}` makes tanh expressions more costly
-- Use to bias search toward simpler functional forms
 
 ### Configuration Principles
 
 1. Only reference operators included in binary_operators/unary_operators
 2. **Always constrain `^`** when included: `{"^": [-1, 1]}`
 3. **Always constrain `/`** when included: `{"/": [-1, 3]}`
-4. **Always limit nesting for complex unary operators** (unless necessary):
-   - Prevent self-nesting: `{op: {op: 0}}`
-   - Prevent inappropriate cross-nesting: e.g., `{"exp": {"log": 0}}`, `{"log": {"exp": 0}}`
+4. **Always limit nesting for complex unary operators** unless necessary
 5. **Assign higher complexity cost to exotic operators** like tanh when included
 
 ## Evolution Parameters
@@ -158,8 +157,6 @@ Principles:
 - **populations** (default 31): Parallel search populations (typical: 15-50)
 - **niterations** (default 40): Evolution cycles (typical: 20-60)
 - **population_size** (default 27): Individuals per population
-
-Adjust based on time budget.
 
 ## Example Config
 
@@ -185,11 +182,10 @@ Adapt to actual requirements. Do not copy blindly.
 
 When `search_potential` returns candidates:
 - Select top 3-5 by: lowest loss, interpretability, structural diversity
-- Simplify (conservatively): round coefficients, identify equivalent forms
 - Report each candidate with: expression, ns, r, loss
 
 If `search_potential` returns no valid candidates or all have high loss:
-- Report failure clearly to main agent with the config used
+- Report failure clearly with the config used
 - Do not invent or fabricate results
 
 # OUTPUT FORMAT
@@ -208,39 +204,320 @@ Return in this format:
 
 
 # ============================================================================
-# UI Helpers
+# Tool Schemas and UI Helpers
 # ============================================================================
 
-# Tool display config: tool_name -> (emoji, display_title, is_long_running)
+MAIN_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_potential",
+            "description": "Compute ns, r, A_s for a concrete inflation potential.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Potential V(phi) using only phi and concrete numbers.",
+                    }
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plot_potential",
+            "description": "Generate a 3-panel diagnostic plot for a concrete inflation potential.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Potential V(phi) using only phi and concrete numbers.",
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Optional output path for the PNG file.",
+                    },
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_encyclopedia",
+            "description": "Look up inflation models and cosmology concepts in the encyclopedia.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Plain English search query.",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of parent documents to return.",
+                        "default": 3,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_sr_agent",
+            "description": "Delegate model discovery to the dedicated symbolic regression agent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "A concise description of the target observables and constraints.",
+                    }
+                },
+                "required": ["task"],
+            },
+        },
+    },
+]
+
+SR_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_potential",
+            "description": "Run PySR symbolic regression to discover inflation potentials.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "config_json": {
+                        "type": "string",
+                        "description": "A complete JSON config for search_potential.",
+                    }
+                },
+                "required": ["config_json"],
+            },
+        },
+    }
+]
+
 TOOL_DISPLAY_CONFIG = {
     "analyze_potential": ("🔬", "Analyzing", False),
     "plot_potential": ("📊", "Plotting", False),
     "search_encyclopedia": ("📚", "Encyclopedia", False),
+    "run_sr_agent": ("🤝", "SR Agent", False),
     "search_potential": ("🧬", "Symbolic Regression", True),
 }
 
+DEFAULT_MAIN_AGENT_MAX_STEPS = 8
+DEFAULT_SR_AGENT_MAX_STEPS = 4
 
-def _format_tool_info(tool_name: str, args: dict) -> dict:
-    """Format tool info for UI display."""
-    if tool_name == "delegate_task_to_member":
-        member_name = args.get("member_id", "member").replace("-", " ").title()
-        return {
-            "tool_name": tool_name,
-            "title": f"🤝 Delegate to {member_name}",
-            "log": "",
+
+# ============================================================================
+# Basic Supporting Classes
+# ============================================================================
+
+
+class SessionStore:
+    """Store only the main user/assistant conversation in SQLite."""
+
+    def __init__(self, db_path: str = "tmp/agent_storage.db"):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+
+    def append(self, session_id: str, role: str, content: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO conversation_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                (session_id, role, content, time.time()),
+            )
+
+    def load(self, session_id: str, limit_turns: int = 5) -> list[dict]:
+        limit = max(1, limit_turns) * 2
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT role, content
+                FROM conversation_messages
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+
+        rows.reverse()
+        return [{"role": role, "content": content} for role, content in rows]
+
+
+class Agent:
+    """A minimal chat-completions wrapper for one agent prompt."""
+
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        system_prompt: str,
+        tools: list[dict] | None = None,
+        temperature: float = 1.0,
+    ):
+        self.client = client
+        self.model = model
+        self.system_prompt = system_prompt
+        self.tools = tools or []
+        self.temperature = temperature
+
+    async def complete(self, messages: list[dict]):
+        request_messages = [{"role": "system", "content": self.system_prompt}, *messages]
+        kwargs = {
+            "model": self.model,
+            "messages": request_messages,
+            "temperature": self.temperature,
         }
+        if self.tools:
+            kwargs["tools"] = self.tools
 
-    emoji, title, long_running = TOOL_DISPLAY_CONFIG.get(tool_name, ("🔧", tool_name, False))
-    result = {"tool_name": tool_name, "title": f"{emoji} {title}", "log": ""}
-    if long_running:
-        result["long_running"] = True
-    return result
+        response = await self.client.chat.completions.create(**kwargs)
+        return response.choices[0].message
+
+    @staticmethod
+    def text_from_message(message) -> str:
+        """Normalize SDK message content to plain text."""
+        content = message.content
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif getattr(item, "type", None) == "text":
+                    parts.append(getattr(item, "text", ""))
+            return "".join(parts)
+        return str(content)
+
+    @staticmethod
+    def assistant_message(message) -> dict:
+        """Convert an SDK assistant message back into chat-completions input format."""
+        result = {"role": "assistant", "content": Agent.text_from_message(message)}
+        if message.tool_calls:
+            result["tool_calls"] = [
+                {
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                }
+                for tool_call in message.tool_calls
+            ]
+        return result
 
 
-def _extract_sr_config(config_json_str: str) -> dict:
-    """Extract key SR config info for display."""
-    try:
-        config = json.loads(config_json_str)
+# ============================================================================
+# DeepInflation Agent
+# ============================================================================
+
+
+class DeepInflation:
+    """Inflation cosmology assistant with a dedicated SR sub-agent."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str = "gpt-5.2",
+        embedding_model: str = "text-embedding-3-small",
+        temperature: float = 1.0,
+        main_agent_max_steps: int = DEFAULT_MAIN_AGENT_MAX_STEPS,
+        sr_agent_max_steps: int = DEFAULT_SR_AGENT_MAX_STEPS,
+        verbose: bool = True,
+    ):
+        self._api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self._api_key:
+            raise ValueError("API key required. Set OPENAI_API_KEY or pass api_key.")
+
+        self._base_url = base_url or os.getenv("BASE_URL") or None
+        self.verbose = verbose
+        self.last_plot_path: str | None = None
+        self.session_id = str(uuid4())
+        self.main_agent_max_steps = max(1, main_agent_max_steps)
+        self.sr_agent_max_steps = max(1, sr_agent_max_steps)
+        self._store = SessionStore()
+        self._client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
+
+        # Keep the existing behavior: one main agent and one SR sub-agent.
+        from . import encyclopedia_rag as rag_module
+        from . import sr_search as sr_module
+        from . import tools as tools_module
+
+        tools_module.VERBOSE = rag_module.VERBOSE = sr_module.VERBOSE = verbose
+
+        # Initialize the encyclopedia once at startup.
+        init_rag(
+            api_key=self._api_key,
+            base_url=self._base_url,
+            embedding_model=embedding_model,
+        )
+
+        self.main_agent = Agent(
+            client=self._client,
+            model=model,
+            system_prompt=MAIN_AGENT_PROMPT,
+            tools=MAIN_TOOL_SCHEMAS,
+            temperature=temperature,
+        )
+        self.sr_agent = Agent(
+            client=self._client,
+            model=model,
+            system_prompt=SR_AGENT_PROMPT,
+            tools=SR_TOOL_SCHEMAS,
+            temperature=temperature,
+        )
+
+        self._log(f"[Agent] Initializing with model={model}, base_url={self._base_url or 'default'}")
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(message)
+
+    def _format_tool_info(self, tool_name: str) -> dict:
+        """Format tool metadata for the UI."""
+        emoji, title, long_running = TOOL_DISPLAY_CONFIG.get(tool_name, ("🔧", tool_name, False))
+        info = {"tool_name": tool_name, "title": f"{emoji} {title}", "log": ""}
+        if long_running:
+            info["long_running"] = True
+        return info
+
+    def _extract_sr_config(self, config_json_str: str) -> dict:
+        """Extract a short SR config summary for the UI."""
+        try:
+            config = json.loads(config_json_str)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
         iterations = config.get("niterations", 40)
         return {
             "ns_target": config.get("ns_target", 0.9649),
@@ -251,96 +528,101 @@ def _extract_sr_config(config_json_str: str) -> dict:
             "operators": config.get("binary_operators", []) + config.get("unary_operators", []),
             "iterations": iterations,
             "populations": config.get("populations", 31),
-            "estimated_time": f"~{iterations // 10} min",
+            "estimated_time": f"~{max(1, iterations // 10)} min",
         }
-    except (json.JSONDecodeError, TypeError):
-        return {}
 
+    async def _run_tool(self, tool_name: str, tool_args: dict) -> str:
+        """Run one local tool and keep small UI state in sync."""
+        if tool_name == "analyze_potential":
+            return analyze_potential(tool_args["expression"])
 
-# ============================================================================
-# DeepInflation Agent
-# ============================================================================
+        if tool_name == "plot_potential":
+            output_path = tool_args.get("output_path", "./potential_plot.png")
+            result = plot_potential(tool_args["expression"], output_path)
+            try:
+                parsed = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
 
+            if isinstance(parsed, dict) and parsed.get("success", True):
+                path = parsed.get("plot_path")
+                if path and os.path.exists(path):
+                    self.last_plot_path = path
+            return result
 
-class DeepInflation:
-    """Inflation cosmology research agent with conversation management.
+        if tool_name == "search_encyclopedia":
+            return search_encyclopedia(tool_args["query"], tool_args.get("top_k", 3))
 
-    Manages Agno Team, RAG system, session state, and streaming interface.
-    """
+        raise ValueError(f"Unknown tool: {tool_name}")
 
-    def __init__(
-        self,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        model: str = "gpt-5.2",
-        embedding_model: str = "text-embedding-3-small",
-        temperature: float = 1.0,
-        verbose: bool = True,
-    ):
-        self._api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self._api_key:
-            raise ValueError("API key required. Set OPENAI_API_KEY or pass api_key.")
-        self._base_url = base_url or os.getenv("BASE_URL")
-        self.verbose = verbose
+    async def _run_sr_agent_stream(self, task: str):
+        """Run the dedicated SR sub-agent in its own short context."""
+        messages = [{"role": "user", "content": task}]
 
-        self._model = OpenAILike(
-            id=model,
-            api_key=self._api_key,
-            base_url=self._base_url,
-            temperature=temperature,
-        )
+        # The SR sub-agent gets its own short loop and context. It is responsible
+        # for configuring PySR once, running the search once, then summarizing the
+        # result back to the main agent.
+        for _ in range(self.sr_agent_max_steps):
+            message = await self.sr_agent.complete(messages)
+            tool_calls = list(message.tool_calls or [])
 
-        # Set verbose flag for submodules
-        from . import encyclopedia_rag as rag_module
-        from . import sr_search as sr_module
-        from . import tools as tools_module
+            if not tool_calls:
+                yield {"type": "sr_result", "content": self.sr_agent.text_from_message(message).strip()}
+                return
 
-        tools_module.VERBOSE = rag_module.VERBOSE = sr_module.VERBOSE = verbose
+            messages.append(self.sr_agent.assistant_message(message))
 
-        # Initialize Encyclopedia RAG (singleton)
-        init_rag(
-            api_key=self._api_key,
-            base_url=self._base_url,
-            embedding_model=embedding_model,
-        )
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                try:
+                    tool_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid tool arguments: {exc}") from exc
+                call_id = f"sr_{tool_name}_{time.time()}"
+                start_time = time.time()
 
-        self._db = SqliteDb(
-            db_file="tmp/agent_storage.db",
-            session_table="inflation_agent_sessions",
-        )
+                self._log(f"[SR Tool] {tool_name} input={str(tool_args)[:500]}")
+                yield {
+                    "type": "tool_start",
+                    "call_id": call_id,
+                    "info": self._format_tool_info(tool_name),
+                    "args": tool_args,
+                }
 
-        if verbose:
-            print(f"[Agent] Initializing with model={model}, base_url={self._base_url or 'default'}")
+                if tool_name == "search_potential":
+                    sr_config = self._extract_sr_config(tool_args.get("config_json", "{}"))
+                    if sr_config:
+                        yield {"type": "sr_config", "config": sr_config}
+                    result = search_potential(tool_args.get("config_json", "{}"))
+                else:
+                    result = json.dumps({"success": False, "error": f"Unknown SR tool: {tool_name}"})
 
-        # Session state
-        self.session_id = str(uuid4())
-        self.last_plot_path: str | None = None
-        self.team = self._create_team()
+                duration = time.time() - start_time
+                try:
+                    parsed = json.loads(result)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                success = parsed.get("success", True) if isinstance(parsed, dict) else True
+                self._log(f"[SR Tool] {tool_name} {'ok' if success else 'failed'} ({duration:.1f}s)")
 
-    def _create_team(self) -> Team:
-        """Create Agno Team with SR sub-agent."""
-        sr_agent = Agent(
-            name="SR Agent",
-            model=self._model,
-            role="Configure and run symbolic regression for inflation potentials",
-            instructions=SR_AGENT_PROMPT,
-            tools=[search_potential],
-            add_history_to_context=True,
-            num_history_runs=3,
-            markdown=True,
-        )
-        return Team(
-            name="Inflation Research Team",
-            model=self._model,
-            members=[sr_agent],
-            tools=[analyze_potential, plot_potential, search_encyclopedia],
-            instructions=MAIN_AGENT_PROMPT,
-            show_members_responses=True,
-            markdown=True,
-            db=self._db,
-            add_history_to_context=True,
-            num_history_runs=5,
-        )
+                yield {
+                    "type": "tool_end",
+                    "call_id": call_id,
+                    "duration": duration,
+                    "success": success,
+                }
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    }
+                )
+
+        yield {
+            "type": "sr_result",
+            "content": "Symbolic regression agent reached the step limit before finishing.",
+        }
 
     async def stream(self, question: str):
         """Async streaming interface for Gradio.
@@ -353,118 +635,92 @@ class DeepInflation:
             {"type": "response", "content": str, "plot_path": str|None}
         """
         self.last_plot_path = None
-        pending_tools = {}  # call_id -> (tool_name, info, args, start_time)
-        accumulated_text = ""
 
         try:
-            async for event in self.team.arun(
-                input=question,
-                stream=True,
-                stream_events=True,
-                session_id=self.session_id,
-            ):
-                # Tool call started (Team or Member)
-                if event.event in (
-                    TeamRunEvent.tool_call_started,
-                    RunEvent.tool_call_started,
-                ):
-                    tool_name = event.tool.tool_name
-                    tool_args = event.tool.tool_args or {}
-                    is_member = event.event == RunEvent.tool_call_started
+            # Only keep recent main-dialogue turns in the main agent context.
+            messages = [*self._store.load(self.session_id, limit_turns=5), {"role": "user", "content": question}]
+            self._store.append(self.session_id, "user", question)
 
-                    if self.verbose:
-                        prefix = "[Member Tool]" if is_member else "[Tool]"
-                        args_str = str(tool_args)[:500]
-                        print(f"{prefix} {tool_name}\n  Input: {args_str}{'...' if len(str(tool_args)) > 500 else ''}")
+            # Main agent loop: ask the model what to do next, run any requested
+            # tools, feed tool results back, and stop as soon as a final answer is
+            # produced. The loop limit stays configurable to avoid a hard-coded
+            # retry count while still preventing runaway tool recursion.
+            for _ in range(self.main_agent_max_steps):
+                message = await self.main_agent.complete(messages)
+                tool_calls = list(message.tool_calls or [])
 
-                    info = _format_tool_info(tool_name, tool_args)
-                    call_id = f"{'member' if is_member else 'team'}_{tool_name}_{time.time()}"
-                    pending_tools[call_id] = (tool_name, info, tool_args, time.time())
+                if not tool_calls:
+                    answer = self.main_agent.text_from_message(message).strip()
+                    if answer:
+                        yield {"type": "text_delta", "delta": answer}
+                    self._store.append(self.session_id, "assistant", answer)
+                    yield {"type": "response", "content": answer, "plot_path": self.last_plot_path}
+                    return
+
+                messages.append(self.main_agent.assistant_message(message))
+
+                for tool_call in tool_calls:
+                    tool_name = tool_call.function.name
+                    try:
+                        tool_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid tool arguments: {exc}") from exc
+                    call_id = f"main_{tool_name}_{time.time()}"
+                    start_time = time.time()
+
+                    self._log(f"[Tool] {tool_name} input={str(tool_args)[:500]}")
                     yield {
                         "type": "tool_start",
                         "call_id": call_id,
-                        "info": info,
+                        "info": self._format_tool_info(tool_name),
                         "args": tool_args,
                     }
 
-                    # SR config display (member only)
-                    if is_member and tool_name == "search_potential":
-                        sr_config = _extract_sr_config(tool_args.get("config_json", "{}"))
-                        if sr_config:
-                            yield {"type": "sr_config", "config": sr_config}
+                    if tool_name == "run_sr_agent":
+                        result = ""
+                        async for event in self._run_sr_agent_stream(tool_args["task"]):
+                            if event["type"] == "sr_result":
+                                result = event["content"]
+                            else:
+                                yield event
+                    else:
+                        result = await self._run_tool(tool_name, tool_args)
 
-                # Tool call completed (Team or Member)
-                elif event.event in (
-                    TeamRunEvent.tool_call_completed,
-                    RunEvent.tool_call_completed,
-                ):
-                    tool_name = event.tool.tool_name
-                    result = event.tool.result
-                    is_member = event.event == RunEvent.tool_call_completed
-
-                    # Parse success from JSON result
-                    success = True
+                    duration = time.time() - start_time
                     try:
-                        output = json.loads(result) if isinstance(result, str) else result
-                        if isinstance(output, dict):
-                            success = output.get("success", True)
+                        parsed = json.loads(result)
                     except (json.JSONDecodeError, TypeError):
-                        output = None
+                        parsed = None
+                    success = parsed.get("success", True) if isinstance(parsed, dict) else True
+                    self._log(f"[Tool] {tool_name} {'ok' if success else 'failed'} ({duration:.1f}s)")
 
-                    # Find and pop matching pending tool
-                    call_id = next(
-                        (cid for cid, (name, *_) in pending_tools.items() if name == tool_name),
-                        None,
-                    )
-                    if call_id:
-                        _, _, _, start_time = pending_tools.pop(call_id)
-                        duration = time.time() - start_time
-
-                        if self.verbose:
-                            prefix = "[Member Tool]" if is_member else "[Tool]"
-                            output_str = str(result)[:2000] if result else ""
-                            print(
-                                f"{prefix} {tool_name} {'✓' if success else '✗'} ({duration:.1f}s)\n  Output: {output_str}{'...' if len(str(result)) > 2000 else ''}"
-                            )
-
-                        yield {
-                            "type": "tool_end",
-                            "call_id": call_id,
-                            "duration": duration,
-                            "success": success,
+                    yield {
+                        "type": "tool_end",
+                        "call_id": call_id,
+                        "duration": duration,
+                        "success": success,
+                    }
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result,
                         }
+                    )
 
-                        # Extract plot path on success
-                        if tool_name == "plot_potential" and isinstance(output, dict) and output.get("success"):
-                            path = output.get("plot_path")
-                            if path and os.path.exists(path):
-                                self.last_plot_path = path
+            fallback = "The agent reached the tool loop limit before producing a final answer."
+            self._store.append(self.session_id, "assistant", fallback)
+            yield {"type": "response", "content": fallback, "plot_path": self.last_plot_path}
 
-                # Content streaming
-                elif event.event == TeamRunEvent.run_content:
-                    if event.content:
-                        accumulated_text += event.content
-                        yield {"type": "text_delta", "delta": event.content}
-
-            yield {
-                "type": "response",
-                "content": accumulated_text,
-                "plot_path": self.last_plot_path,
-            }
-
-        except Exception as e:
-            if self.verbose:
-                print(f"[Agent] Error: {e}")
-                import traceback
-
-                traceback.print_exc()
-            yield {"type": "response", "content": f"Error: {e}", "plot_path": None}
+        except Exception as exc:
+            self._log(f"[Agent] Error: {exc}")
+            yield {"type": "response", "content": f"Error: {exc}", "plot_path": None}
 
     def run(self, question: str) -> str:
-        """Synchronous interface - returns final response only."""
+        """Synchronous helper that returns only the final answer."""
         import asyncio
 
-        async def get_response():
+        async def get_response() -> str:
             async for event in self.stream(question):
                 if event["type"] == "response":
                     return event["content"]
@@ -473,11 +729,10 @@ class DeepInflation:
         return asyncio.run(get_response())
 
     def clear_history(self):
-        """Clear conversation history by creating new session."""
+        """Clear conversation history by creating a new session."""
         self.session_id = str(uuid4())
         self.last_plot_path = None
-        if self.verbose:
-            print("[Agent] History cleared (new session)")
+        self._log("[Agent] History cleared (new session)")
 
 
 # ============================================================================
@@ -495,21 +750,21 @@ if __name__ == "__main__":
     print("DeepInflation")
     print("=" * 60)
     print("\nExamples:")
-    print("  • What is ns for V = phi^2?")
-    print("  • Plot the Starobinsky model: (1 - exp(-sqrt(2/3)*phi))^2")
-    print("  • Find a plateau potential with r < 0.01")
+    print("  - What is ns for V = phi^2?")
+    print("  - Plot the Starobinsky model: (1 - exp(-sqrt(2/3)*phi))^2")
+    print("  - Find a plateau potential with r < 0.01")
     print("\nType 'quit' to exit, 'clear' to reset conversation\n")
 
     async def main():
         agent = DeepInflation(verbose=False)
-        pending_tools = {}  # call_id -> title
+        pending_tools = {}
 
         while True:
             try:
                 question = input("> ").strip()
                 if not question:
                     continue
-                if question.lower() in ("quit", "exit", "q"):
+                if question.lower() in {"quit", "exit", "q"}:
                     print("Goodbye!")
                     break
                 if question.lower() == "clear":
@@ -517,42 +772,31 @@ if __name__ == "__main__":
                     pending_tools.clear()
                     continue
 
-                print("\n⏳ Thinking...")
+                print("\nThinking...")
 
                 async for event in agent.stream(question):
                     if event["type"] == "tool_start":
-                        info = event["info"]
-                        call_id = event["call_id"]
-                        title = info.get("title", "Tool")
-                        log = info.get("log", "")
-                        pending_tools[call_id] = title
-                        print(f"  {title} {log}..." if log else f"  {title}...")
+                        title = event["info"].get("title", "Tool")
+                        pending_tools[event["call_id"]] = title
+                        print(f"  {title}...")
                     elif event["type"] == "sr_config":
                         config = event["config"]
                         print(
-                            f"    Config: ns={config.get('ns_target')}±{config.get('ns_sigma')}, "
-                            f"r={config.get('r_target')}±{config.get('r_sigma')}"
+                            f"    Config: ns={config['ns_target']}+-{config['ns_sigma']}, "
+                            f"r={config['r_target']}+-{config['r_sigma']}"
                         )
-                        print(f"    Ops: {config.get('operators')}")
-                        print(f"    Est: {config.get('estimated_time')}")
+                        print(f"    Ops: {config['operators']}")
+                        print(f"    Est: {config['estimated_time']}")
                     elif event["type"] == "tool_end":
-                        call_id = event["call_id"]
-                        duration = event.get("duration", 0)
-                        title = pending_tools.pop(call_id, "Tool")
-                        print(f"  {title} ✓ ({duration:.1f}s)")
+                        title = pending_tools.pop(event["call_id"], "Tool")
+                        print(f"  {title} done ({event.get('duration', 0):.1f}s)")
                     elif event["type"] == "response":
                         print(f"\n{event['content']}\n")
 
             except KeyboardInterrupt:
                 print("\nGoodbye!")
                 break
-            except Exception as e:
-                print(f"❌ Error: {e}\n")
+            except Exception as exc:
+                print(f"Error: {exc}\n")
 
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        print(f"✗ Failed to initialize: {e}")
-        import sys
-
-        sys.exit(1)
+    asyncio.run(main())

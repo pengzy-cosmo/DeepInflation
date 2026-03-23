@@ -1,6 +1,6 @@
 # DeepInflation
 
-DeepInflation is an AI Agent for Inflationary Cosmology Research and Model Discovery, built on [Agno](https://github.com/agno-agi/agno).
+DeepInflation is an AI agent for inflationary cosmology research and model discovery.
 
 The agent integrates symbolic regression ([PySR](https://github.com/MilesCranmer/PySR)) to discover inflationary potentials from observational constraints and a RAG knowledge base derived from [Encyclopædia Inflationaris](https://arxiv.org/abs/1303.3787) for theoretical background.
 
@@ -10,7 +10,7 @@ The agent integrates symbolic regression ([PySR](https://github.com/MilesCranmer
 
 ### 1. Python
 
-Requires Python 3.10+.
+Requires Python 3.12+.
 
 ```bash
 # uv (recommended)

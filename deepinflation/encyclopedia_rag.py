@@ -1,33 +1,26 @@
-"""Encyclopedia RAG: Parent Document Retrieval with LanceDB hybrid search.
+"""Encyclopedia RAG built directly on OpenAI embeddings and LanceDB."""
 
-Architecture:
-- Small chunks for precise semantic matching
-- Parent documents (sections or full files) for complete context
-- Retrieval: search chunks -> score parents by RRF -> return top-N parents
-"""
-
-import asyncio
 import json
-import os
 from hashlib import md5
 from pathlib import Path
 
+import lancedb
 import tiktoken
-from agno.knowledge.embedder.openai import OpenAIEmbedder
-from agno.vectordb.lancedb import LanceDb, SearchType
+from lancedb.rerankers import RRFReranker
+from openai import OpenAI
 
-# Configuration
 _PROJECT_ROOT = Path(__file__).parent.parent
 MODELS_DIR = _PROJECT_ROOT / "data/models"
 MODEL_LIST_PATH = _PROJECT_ROOT / "data/model_list.json"
 LANCEDB_DIR = _PROJECT_ROOT / "tmp/lancedb"
 TABLE_NAME = "encyclopedia_chunks"
 CONFIG_FILE = "embedding_config.json"
-CHUNK_TOKENS = 500  # Small chunks for precise matching
-PARENT_MAX_TOKENS = 5000  # Files larger than this are split by H1 sections
+CHUNK_TOKENS = 500
+PARENT_MAX_TOKENS = 5000
+EMBED_BATCH_SIZE = 128
 VERBOSE = True
 
-_enc = tiktoken.get_encoding("cl100k_base")
+_enc = None
 
 
 def _print(*args, **kwargs):
@@ -36,11 +29,21 @@ def _print(*args, **kwargs):
 
 
 def _tokens(text: str) -> int:
+    global _enc
+    if _enc is None:
+        try:
+            _enc = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _enc = False
+
+    if _enc is False:
+        return max(1, len(text.split()))
+
     return len(_enc.encode(text))
 
 
 class EncyclopediaRAG:
-    """Parent Document RAG: search small chunks, return full parent documents."""
+    """Search chunks, return parent documents."""
 
     def __init__(
         self,
@@ -49,78 +52,68 @@ class EncyclopediaRAG:
         embedding_model: str = "text-embedding-3-small",
     ):
         self.embedding_model = embedding_model
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.db = lancedb.connect(str(LANCEDB_DIR))
         self.config_path = Path(LANCEDB_DIR) / CONFIG_FILE
         self.parent_store: dict[str, dict] = {}
+        self.table = None
 
         _print("[Encyclopedia] Initializing...")
-
-        # Initialize embedder
-        self.embedder = OpenAIEmbedder(
-            id=embedding_model,
-            api_key=api_key,
-            base_url=base_url,
-            enable_batch=True,
-            batch_size=300,
-        )
-        self.embedder.dimensions = len(self.embedder.get_embedding("test"))
-        _print(f"[Encyclopedia] Embedding: '{embedding_model}' (dim={self.embedder.dimensions})")
-
-        # Initialize vector database
-        self.vector_db = LanceDb(
-            uri=LANCEDB_DIR,
-            table_name=TABLE_NAME,
-            search_type=SearchType.hybrid,
-            embedder=self.embedder,
-        )
-
-        # Load existing index or build new one
-        saved = json.load(open(self.config_path, encoding="utf-8")) if self.config_path.exists() else {}
-        count = self.vector_db.get_count()
-
-        if count > 0 and saved.get("embedding_model") == embedding_model:
-            self.parent_store = saved.get("parent_store", {})
-            _print(f"[Encyclopedia] Loaded {count} chunks, {len(self.parent_store)} parents")
-        else:
-            if count > 0:
-                _print("[Encyclopedia] Config changed, rebuilding...")
-                self.vector_db.drop()
-                self.vector_db.create()
-            self._build_index()
-
+        self._open_or_build_index()
         _print(f"[Encyclopedia] Ready ({len(self.parent_store)} parents)")
 
-    def _build_index(self):
-        """Build chunk index and parent store from markdown files."""
-        _print("[Index] Building...")
+    def _open_or_build_index(self) -> None:
+        """Reuse an existing index when config matches; otherwise rebuild it."""
+        saved = {}
+        if self.config_path.exists():
+            with open(self.config_path, encoding="utf-8") as f:
+                saved = json.load(f)
 
-        # Load potential metadata from model_list.json
-        potentials = {}
-        meta_path = Path(MODEL_LIST_PATH)
-        if meta_path.exists():
-            for entry in json.load(open(meta_path, encoding="utf-8")):
-                potentials[entry["Model"]] = {
-                    "potential_latex": entry.get("Potential $V(\\phi)$", ""),
-                    "parameters": entry.get("Parameters", ""),
-                }
-            _print(f"[Index] Loaded {len(potentials)} potential metadata")
+        config_matches = (
+            saved.get("embedding_model") == self.embedding_model
+            and saved.get("chunk_tokens") == CHUNK_TOKENS
+            and saved.get("parent_max_tokens") == PARENT_MAX_TOKENS
+        )
 
-        all_chunks = []  # List of (chunk_content, parent_id)
+        if TABLE_NAME in self.db.table_names() and config_matches:
+            self.table = self.db.open_table(TABLE_NAME)
+            self.parent_store = saved.get("parent_store", {})
+            if self.table.count_rows() > 0 and self.parent_store:
+                _print(f"[Encyclopedia] Loaded {self.table.count_rows()} chunks, {len(self.parent_store)} parents")
+                return
 
-        for md_file in sorted(Path(MODELS_DIR).glob("*.md")):
+        self._build_index()
+
+    def _build_index(self) -> None:
+        """Build parent docs, chunk them, embed them, then store the index."""
+        _print("[Encyclopedia] Building index...")
+
+        metadata_by_model = {}
+        if MODEL_LIST_PATH.exists():
+            with open(MODEL_LIST_PATH, encoding="utf-8") as f:
+                for entry in json.load(f):
+                    metadata_by_model[entry["Model"]] = {
+                        "potential_latex": entry.get("Potential $V(\\phi)$", ""),
+                        "parameters": entry.get("Parameters", ""),
+                    }
+
+        self.parent_store = {}
+        rows = []
+
+        for md_file in sorted(MODELS_DIR.glob("*.md")):
             content = md_file.read_text(encoding="utf-8").strip()
             if len(content) < 100:
                 continue
 
             model_name = md_file.stem
-            metadata = potentials.get(model_name, {})
-
-            # Split into parents: whole file for short, by sections for long
-            if _tokens(content) <= PARENT_MAX_TOKENS:
-                parents = [(model_name, content)]
-            else:
+            metadata = metadata_by_model.get(model_name, {})
+            # Parent documents are the units returned to the model. Large markdown
+            # files are split by top-level sections so retrieval returns coherent
+            # context instead of one oversized blob.
+            parents = [(model_name, content)]
+            if _tokens(content) > PARENT_MAX_TOKENS:
                 parents = self._split_by_sections(content, model_name)
 
-            # Process each parent
             for title, text in parents:
                 parent_id = md5(title.encode()).hexdigest()[:16]
                 self.parent_store[parent_id] = {
@@ -130,64 +123,65 @@ class EncyclopediaRAG:
                     "model": model_name,
                 }
 
-                # Remove header line for chunking
+                body = text
                 lines = text.split("\n")
-                body = "\n".join(lines[1:]).strip() if lines[0].startswith("# ") else text
+                if lines and lines[0].startswith("# "):
+                    body = "\n".join(lines[1:]).strip()
 
+                # The vector index works on smaller paragraph chunks, but each
+                # chunk still points back to its parent document for final output.
                 for chunk in self._chunk_by_paragraphs(body):
-                    all_chunks.append((chunk, parent_id))
-
-            _print(f"[Index] {model_name}: {len(parents)} parent(s)")
-
-        _print(f"[Index] Total: {len(all_chunks)} chunks from {len(self.parent_store)} parents")
-
-        # Batch embed all chunks
-        _print("[Index] Batch embedding...")
-        contents = [c[0] for c in all_chunks]
-        embeddings, _ = asyncio.run(self.embedder.async_get_embeddings_batch_and_usage(contents))
-        _print(f"[Index] Got {len(embeddings)} embeddings")
-
-        # Insert into LanceDB
-        _print("[Index] Inserting into LanceDB...")
-        data = []
-        for i, (chunk, parent_id) in enumerate(all_chunks):
-            parent = self.parent_store[parent_id]
-            data.append(
-                {
-                    "id": md5(chunk.encode()).hexdigest(),
-                    "vector": embeddings[i],
-                    "payload": json.dumps(
+                    rows.append(
                         {
-                            "name": parent["title"],
-                            "meta_data": {
-                                "parent_id": parent_id,
-                                "model": parent["model"],
-                            },
-                            "content": chunk.replace("\x00", "\ufffd"),
-                            "usage": None,
-                            "content_id": None,
-                            "content_hash": "encyclopedia",
+                            "id": md5(f"{parent_id}:{chunk}".encode()).hexdigest(),
+                            "parent_id": parent_id,
+                            "model": model_name,
+                            "title": title,
+                            "text": chunk.replace("\x00", " "),
                         }
-                    ),
-                }
-            )
-        self.vector_db.table.add(data)
+                    )
 
-        # Save config with parent store
+            _print(f"[Encyclopedia] Indexed {model_name}: {len(parents)} parent(s)")
+
+        if not rows:
+            raise RuntimeError("No encyclopedia documents found to index")
+
+        # Embeddings are generated in batches before writing to LanceDB so the
+        # table can serve hybrid vector + full-text retrieval.
+        texts = [row["text"] for row in rows]
+        embeddings = []
+        for start in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = texts[start : start + EMBED_BATCH_SIZE]
+            response = self.client.embeddings.create(model=self.embedding_model, input=batch)
+            embeddings.extend(item.embedding for item in response.data)
+            _print(f"[Encyclopedia] Embedded {min(start + len(batch), len(texts))}/{len(texts)} chunks")
+
+        for row, embedding in zip(rows, embeddings, strict=True):
+            row["vector"] = embedding
+
+        if TABLE_NAME in self.db.table_names():
+            self.db.drop_table(TABLE_NAME)
+        self.table = self.db.create_table(TABLE_NAME, data=rows, mode="overwrite")
+        self.table.create_index(vector_column_name="vector", replace=True)
+        self.table.create_fts_index("text", replace=True)
+
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        json.dump(
-            {
-                "embedding_model": self.embedding_model,
-                "parent_store": self.parent_store,
-            },
-            open(self.config_path, "w", encoding="utf-8"),
-            ensure_ascii=False,
-        )
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "embedding_model": self.embedding_model,
+                    "chunk_tokens": CHUNK_TOKENS,
+                    "parent_max_tokens": PARENT_MAX_TOKENS,
+                    "parent_store": self.parent_store,
+                },
+                f,
+                ensure_ascii=False,
+            )
 
-        _print(f"[Index] Built {self.vector_db.get_count()} chunks -> {LANCEDB_DIR}/")
+        _print(f"[Encyclopedia] Built {self.table.count_rows()} chunks")
 
     def _split_by_sections(self, content: str, model_name: str) -> list[tuple[str, str]]:
-        """Split markdown by H1 headers into sections."""
+        """Split a large markdown file into parent documents by top-level headings."""
         sections = []
         current_lines = []
         current_title = model_name
@@ -195,19 +189,16 @@ class EncyclopediaRAG:
 
         for line in content.split("\n"):
             if line.startswith("# "):
-                # Save previous section
                 if current_lines:
                     text = "\n".join(current_lines).strip()
                     if _tokens(text) > 50:
                         sections.append((current_title, text))
-                # Start new section
                 current_title = model_name if is_first else f"{model_name} - {line[2:].strip()}"
-                is_first = False
                 current_lines = [line]
+                is_first = False
             else:
                 current_lines.append(line)
 
-        # Last section
         if current_lines:
             text = "\n".join(current_lines).strip()
             if _tokens(text) > 50:
@@ -216,7 +207,7 @@ class EncyclopediaRAG:
         return sections or [(model_name, content)]
 
     def _chunk_by_paragraphs(self, text: str) -> list[str]:
-        """Split text into chunks respecting paragraph boundaries."""
+        """Group nearby paragraphs into retrieval chunks under the token budget."""
         if _tokens(text) <= CHUNK_TOKENS:
             return [text]
 
@@ -224,28 +215,27 @@ class EncyclopediaRAG:
         current = []
         current_tokens = 0
 
-        for para in text.split("\n\n"):
-            para = para.strip()
-            if not para:
+        for paragraph in text.split("\n\n"):
+            paragraph = paragraph.strip()
+            if not paragraph:
                 continue
 
-            para_tokens = _tokens(para)
-
-            # Large paragraph: flush current and add as-is
-            if para_tokens > CHUNK_TOKENS:
+            paragraph_tokens = _tokens(paragraph)
+            if paragraph_tokens > CHUNK_TOKENS:
                 if current:
                     chunks.append("\n\n".join(current))
-                    current, current_tokens = [], 0
-                chunks.append(para)
+                    current = []
+                    current_tokens = 0
+                chunks.append(paragraph)
                 continue
 
-            # Would exceed limit: flush current
-            if current_tokens + para_tokens > CHUNK_TOKENS and current:
+            if current and current_tokens + paragraph_tokens > CHUNK_TOKENS:
                 chunks.append("\n\n".join(current))
-                current, current_tokens = [], 0
+                current = []
+                current_tokens = 0
 
-            current.append(para)
-            current_tokens += para_tokens
+            current.append(paragraph)
+            current_tokens += paragraph_tokens
 
         if current:
             chunks.append("\n\n".join(current))
@@ -253,31 +243,36 @@ class EncyclopediaRAG:
         return chunks
 
     def search(self, query: str, num_chunks: int = 10, num_parents: int = 3) -> list[dict]:
-        """Search using Reciprocal Rank Fusion (RRF) scoring.
-
-        RRF score = sum(1/(k+rank)) for each matched chunk, where k=1.
-        """
-        chunk_results = self.vector_db.search(query, limit=num_chunks)
-        if not chunk_results:
+        if self.table is None:
             return []
 
-        # Score parents using RRF (k=1)
-        scores: dict[str, float] = {}
-        for rank, doc in enumerate(chunk_results):
-            parent_id = doc.meta_data.get("parent_id")
-            if parent_id:
-                scores[parent_id] = scores.get(parent_id, 0) + 1.0 / (rank + 1 + 1)
+        # Retrieve chunk candidates with hybrid search, then merge scores back to
+        # parent documents so the caller receives full model descriptions.
+        query_embedding = self.client.embeddings.create(model=self.embedding_model, input=query).data[0].embedding
+        frame = (
+            self.table.search(query_embedding, query_type="hybrid")
+            .text(query)
+            .rerank(RRFReranker())
+            .limit(num_chunks)
+            .to_pandas()
+        )
 
-        # Return top parents sorted by score
-        ranked = sorted(scores.keys(), key=lambda p: scores[p], reverse=True)
+        if frame.empty:
+            return []
+
+        scores: dict[str, float] = {}
+        for rank, row in enumerate(frame.itertuples(index=False), start=1):
+            parent_id = getattr(row, "parent_id", None)
+            if parent_id:
+                scores[parent_id] = scores.get(parent_id, 0.0) + 1.0 / (rank + 1)
+
+        ranked_ids = sorted(scores, key=scores.get, reverse=True)
         return [
-            {**self.parent_store[pid], "score": scores[pid]} for pid in ranked[:num_parents] if pid in self.parent_store
+            {**self.parent_store[parent_id], "score": scores[parent_id]}
+            for parent_id in ranked_ids[:num_parents]
+            if parent_id in self.parent_store
         ]
 
-
-# ============================================================================
-# Singleton and Tool
-# ============================================================================
 
 _rag: EncyclopediaRAG | None = None
 
@@ -287,26 +282,14 @@ def init_rag(
     base_url: str | None = None,
     embedding_model: str = "text-embedding-3-small",
 ) -> EncyclopediaRAG:
-    """Initialize the RAG singleton."""
+    """Initialize the encyclopedia singleton."""
     global _rag
     _rag = EncyclopediaRAG(api_key, base_url, embedding_model)
     return _rag
 
 
 def search_encyclopedia(query: str, top_k: int = 3) -> str:
-    """Search the Encyclopaedia Inflationaris for inflation models.
-
-    This tool searches a knowledge base of 70+ inflation models from physics literature.
-    Use it to find information about specific inflation models, their potentials,
-    predictions, and theoretical background.
-
-    Args:
-        query: Search query in plain English (no LaTeX or math symbols).
-        top_k: Number of documents to return (default 3, max 5).
-
-    Returns:
-        JSON string containing matched inflation models with full documentation.
-    """
+    """Search the Encyclopaedia Inflationaris and return parent documents."""
     if _rag is None:
         return json.dumps({"success": False, "error": "Encyclopedia not initialized"})
 
@@ -314,8 +297,8 @@ def search_encyclopedia(query: str, top_k: int = 3) -> str:
 
     try:
         results = _rag.search(query, num_chunks=4 * top_k, num_parents=top_k)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)})
 
     if not results:
         return json.dumps(
@@ -330,14 +313,15 @@ def search_encyclopedia(query: str, top_k: int = 3) -> str:
         {
             "success": True,
             "count": len(results),
+            "citation": "Encyclopaedia Inflationaris (https://arxiv.org/abs/1303.3787)",
             "results": [
                 {
-                    "title": r["title"],
-                    "content": r["content"],
-                    "potential_latex": r["metadata"].get("potential_latex", ""),
-                    "parameters": r["metadata"].get("parameters", ""),
+                    "title": result["title"],
+                    "content": result["content"],
+                    "potential_latex": result["metadata"].get("potential_latex", ""),
+                    "parameters": result["metadata"].get("parameters", ""),
                 }
-                for r in results
+                for result in results
             ],
         },
         ensure_ascii=False,
