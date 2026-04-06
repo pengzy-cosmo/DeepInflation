@@ -5,7 +5,7 @@ Two main tools for analyzing inflation potentials:
 - plot_potential: Generate 3-panel diagnostic plot (~2s)
   - Panel 1: V(φ) with trajectory markers (φ_end, N=50, N=60)
   - Panel 2: Slow-roll parameters (ε, η) vs φ
-  - Panel 3: Predicted (ns, r) vs Planck+BK18 posterior
+  - Panel 3: Predicted (ns, r) vs observational posteriors
 """
 
 import json
@@ -18,10 +18,12 @@ from matplotlib.patches import Patch
 
 from .inflation import compute_observables_all_trajectories, generate_plot_data
 
-# Load BK18+Planck posterior data
+# Load observational posterior data
 _PROJECT_ROOT = Path(__file__).parent.parent
 _BK18_DATA_PATH = _PROJECT_ROOT / "data/bk18_planck_posterior.npz"
 _BK18_DATA = np.load(_BK18_DATA_PATH) if _BK18_DATA_PATH.exists() else None
+_PACT_DATA_PATH = _PROJECT_ROOT / "data/planck_act_posterior.npz"
+_PACT_DATA = np.load(_PACT_DATA_PATH) if _PACT_DATA_PATH.exists() else None
 
 VERBOSE = True
 
@@ -60,7 +62,7 @@ def analyze_potential(expression: str) -> str:
 
 
 def plot_potential(expression: str, output_path: str = "./potential_plot.png") -> str:
-    """Generate 3-panel plot: [1] V(φ) with trajectory markers, [2] slow-roll params (ε,η), [3] ns-r plane with Planck+BK18.
+    """Generate 3-panel plot: [1] V(φ) with trajectory markers, [2] slow-roll params (ε,η), [3] ns-r plane with observational contours.
 
     Returns JSON with plot_path.
 
@@ -211,20 +213,47 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
         axes[1].set_title("Slow-roll Parameters", fontsize=11)
         axes[1].grid(True, alpha=0.3, which="both", linestyle=":")
 
-        # Panel 3: ns-r observational plane with Planck+BK18 posterior
-        posterior_color = plt.cm.tab10(0)
+        # Panel 3: ns-r observational plane with external posteriors
+        posterior_legend = []
+        bk18_color = plt.cm.tab10(0)
         if _BK18_DATA is not None:
             ns, r, P = _BK18_DATA["ns"], _BK18_DATA["r"], _BK18_DATA["P_bk18"]
             levels = _BK18_DATA["levels_bk18"]
             # Plot 68% and 95% confidence regions
-            axes[2].contourf(ns, r, P, levels=[levels[0], levels[1]], colors=[posterior_color], alpha=0.4, zorder=1)
-            axes[2].contourf(ns, r, P, levels=[levels[1], P.max()], colors=[posterior_color], alpha=0.8, zorder=2)
-            axes[2].contour(ns, r, P, levels=levels, colors=[posterior_color], linewidths=1.2, alpha=0.9, zorder=3)
+            axes[2].contourf(ns, r, P, levels=[levels[0], levels[1]], colors=[bk18_color], alpha=0.4, zorder=1)
+            axes[2].contourf(ns, r, P, levels=[levels[1], P.max()], colors=[bk18_color], alpha=0.8, zorder=2)
+            axes[2].contour(ns, r, P, levels=levels, colors=[bk18_color], linewidths=1.2, alpha=0.9, zorder=3)
+            posterior_legend.append(
+                Patch(
+                    facecolor=bk18_color,
+                    alpha=0.8,
+                    edgecolor=bk18_color,
+                    linewidth=1.2,
+                    label="BK18 + Planck 2018",
+                )
+            )
+
+        pact_color = plt.cm.tab10(1)
+        if _PACT_DATA is not None:
+            ns, r, P = _PACT_DATA["ns"], _PACT_DATA["r"], _PACT_DATA["P_pact"]
+            levels = _PACT_DATA["levels_pact"]
+            axes[2].contourf(ns, r, P, levels=[levels[0], levels[1]], colors=[pact_color], alpha=0.4, zorder=4)
+            axes[2].contourf(ns, r, P, levels=[levels[1], P.max()], colors=[pact_color], alpha=0.8, zorder=5)
+            axes[2].contour(ns, r, P, levels=levels, colors=[pact_color], linewidths=1.2, alpha=0.9, zorder=6)
+            posterior_legend.append(
+                Patch(
+                    facecolor=pact_color,
+                    alpha=0.8,
+                    edgecolor=pact_color,
+                    linewidth=1.2,
+                    label="BK18 + Planck + ACT DR6",
+                )
+            )
 
         if trajectories_60:
             # Plot trajectory predictions in ns-r plane
             for i, (t60, t50) in enumerate(zip(trajectories_60, trajectories_50, strict=True)):
-                color = plt.cm.tab10((i + 1) % 10)
+                color = plt.cm.tab10((i + 2) % 10)
 
                 # Compute ns-r trajectory line for N ∈ [50, 60]
                 ns_line, r_line = [], []
@@ -263,15 +292,7 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
                 )
 
             # Build legend for Panel 3
-            legend = [
-                Patch(
-                    facecolor=posterior_color,
-                    alpha=0.8,
-                    edgecolor=posterior_color,
-                    linewidth=1.2,
-                    label="Planck+BK18+BAO",
-                )
-            ]
+            legend = list(posterior_legend)
             if len(trajectories_60) > 1:
                 legend.extend(
                     [
@@ -280,8 +301,8 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
                             [0],
                             marker="o",
                             linewidth=2.5,
-                            color=plt.cm.tab10((i + 1) % 10),
-                            markerfacecolor=plt.cm.tab10((i + 1) % 10),
+                            color=plt.cm.tab10((i + 2) % 10),
+                            markerfacecolor=plt.cm.tab10((i + 2) % 10),
                             markeredgecolor="black",
                             markersize=5,
                             label=f"Trajectory #{i + 1}",
@@ -296,7 +317,7 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
                         [0],
                         marker="o",
                         color="w",
-                        markerfacecolor="gray",
+                        markerfacecolor=plt.cm.tab10(2),
                         markeredgecolor="black",
                         markersize=5,
                         linewidth=0,
@@ -307,7 +328,7 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
                         [0],
                         marker="o",
                         color="w",
-                        markerfacecolor="gray",
+                        markerfacecolor=plt.cm.tab10(2),
                         markeredgecolor="black",
                         markersize=7,
                         linewidth=0,
@@ -318,8 +339,8 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
             axes[2].legend(handles=legend, fontsize=9, framealpha=0.95, edgecolor="gray")
             axes[2].grid(True, alpha=0.3, linestyle=":", zorder=0)
             r_all = [t["r"] for t in trajectories_60 + trajectories_50]
-            axes[2].set_xlim([0.945, 1.0])
-            axes[2].set_ylim([0.0, min(0.26, max(max(r_all) * 1.3, 0.06))])
+            axes[2].set_xlim([0.95, 1.0])
+            axes[2].set_ylim([0.0, min(0.26, max(max(r_all) * 1.4, 0.07))])
         else:
             axes[2].text(
                 0.5,
@@ -336,7 +357,7 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
 
         axes[2].set_xlabel("$n_s$", fontsize=12)
         axes[2].set_ylabel("$r$", fontsize=12)
-        axes[2].set_title("Observables vs BK18+Planck", fontsize=11)
+        axes[2].set_title("Observables vs CMB Constraints", fontsize=11)
 
         plt.tight_layout()
         output_path = Path(output_path)
