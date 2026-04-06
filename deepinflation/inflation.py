@@ -81,15 +81,8 @@ def epsilon_derivative(V, V_prime, V_double_prime, phi):
     return M_P2 * (prime / val) * ((double_prime * val - prime**2) / val**2)
 
 
-def find_phi_N(V, V_prime, N_values, phi_end, bound):
-    """Find φ_N via ODE: dφ/dN = M_P² V'/V
-
-    Args:
-        N_values: list of e-fold values to compute
-    Returns:
-        dict {N: phi_N} for valid trajectories
-    """
-    N_max = max(N_values)
+def _solve_phi_trajectory(V, V_prime, phi_end, bound, N_max):
+    """Solve φ(N) with dense output from inflation end back to earlier e-folds."""
 
     def dphi_dN(phi):
         v, vp = V(phi), V_prime(phi)
@@ -105,13 +98,35 @@ def find_phi_N(V, V_prime, N_values, phi_end, bound):
             atol=1e-6,
             dense_output=True,
         )
-        if not sol.success:
-            return {}
-
-        lo, hi = min(phi_end, bound), max(phi_end, bound)
-        return {N: float(sol.sol(N)[0]) for N in N_values if lo <= sol.sol(N)[0] <= hi}
     except Exception:
+        return None, None, None
+
+    if not sol.success or sol.sol is None:
+        return None, None, None
+
+    lo, hi = min(phi_end, bound), max(phi_end, bound)
+    return sol, lo, hi
+
+
+def find_phi_N(V, V_prime, N_values, phi_end, bound):
+    """Find φ_N via ODE: dφ/dN = M_P² V'/V
+
+    Args:
+        N_values: list of e-fold values to compute
+    Returns:
+        dict {N: phi_N} for valid trajectories
+    """
+    N_max = max(N_values)
+    sol, lo, hi = _solve_phi_trajectory(V, V_prime, phi_end, bound, N_max)
+    if sol is None:
         return {}
+
+    phi_values = np.atleast_1d(sol.sol(N_values)[0])
+    return {
+        N: float(phi_N)
+        for N, phi_N in zip(N_values, phi_values, strict=True)
+        if np.isfinite(phi_N) and lo <= phi_N <= hi
+    }
 
 
 def compute_observables(V, V_prime, V_double_prime, phi_min, phi_max, N_values=None):
@@ -129,7 +144,7 @@ def compute_observables(V, V_prime, V_double_prime, phi_min, phi_max, N_values=N
 
     for i in sign_changes:
         try:
-            root = brentq(lambda phi: epsilon(V, V_prime, phi) - 1.0, grid[i], grid[i + 1], rtol=1e-3)
+            root = brentq(lambda phi: epsilon(V, V_prime, phi) - 1.0, grid[i], grid[i + 1], rtol=np.float64(1e-3))
             phi_ends.append(root)
         except Exception:
             continue
