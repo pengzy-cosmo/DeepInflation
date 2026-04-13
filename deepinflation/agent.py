@@ -1,5 +1,6 @@
 """Inflation research agent with a small handwritten agent loop."""
 
+import asyncio
 import json
 import logging
 import os
@@ -240,11 +241,18 @@ class DeepInflation:
         }
 
     async def _run_tool(self, tool_name: str, tool_args: dict) -> str:
+        loop = asyncio.get_running_loop()
+
         if tool_name == "analyze_potential":
-            return analyze_potential(tool_args["expression"])
+            return await loop.run_in_executor(None, analyze_potential, tool_args["expression"])
 
         if tool_name == "plot_potential":
-            result = plot_potential(tool_args["expression"], tool_args.get("output_path", "./potential_plot.png"))
+            result = await loop.run_in_executor(
+                None,
+                plot_potential,
+                tool_args["expression"],
+                tool_args.get("output_path", "./potential_plot.png"),
+            )
             try:
                 parsed = json.loads(result)
                 path = parsed.get("plot_path") if isinstance(parsed, dict) else None
@@ -255,7 +263,12 @@ class DeepInflation:
             return result
 
         if tool_name == "search_encyclopedia":
-            return search_encyclopedia(tool_args["query"], tool_args.get("top_k", 3))
+            return await loop.run_in_executor(
+                None,
+                search_encyclopedia,
+                tool_args["query"],
+                tool_args.get("top_k", 3),
+            )
 
         raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -296,7 +309,8 @@ class DeepInflation:
                     config_summary = self._sr_config_summary(tool_args.get("config_json", "{}"))
                     if config_summary:
                         yield {"type": "sr_config", "config": config_summary}
-                    result = search_potential(tool_args.get("config_json", "{}"))
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(None, search_potential, tool_args.get("config_json", "{}"))
                 else:
                     result = json.dumps({"success": False, "error": f"Unknown SR tool: {tool_name}"})
 
