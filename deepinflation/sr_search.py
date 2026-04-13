@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 JULIA_MODULE = '''
 using Roots, Interpolations, OrdinaryDiffEq
-using Logging: disable_logging, Warn
-disable_logging(Warn)
+using Logging: global_logger, NullLogger
+global_logger(NullLogger())
 
 # -----------------------------
 # Constants
@@ -82,7 +82,7 @@ function find_phi_N(V, V_prime, phi_end, bound)
 
     try
         prob = ODEProblem(dphi_dN!, [phi_end], (zero(T), N_OBS))
-        sol = solve(prob; callback=boundary_cb, reltol=1e-4, maxiters=1000)
+        sol = solve(prob; callback=boundary_cb, reltol=1e-4, maxiters=10_000)
         (sol.retcode == ReturnCode.Success || sol.retcode == ReturnCode.Terminated) || return nothing
 
         phi_N = sol.u[end][1]
@@ -289,6 +289,9 @@ end
 
 def _run_pysr(config: dict) -> dict:
     """Execute PySR in worker process. Returns result dict."""
+    import logging as _logging
+
+    _logging.basicConfig(level=_logging.INFO, format="%(message)s")
 
     from pysr import PySRRegressor, jl
 
@@ -312,9 +315,9 @@ def _run_pysr(config: dict) -> dict:
     if constraints:
         constraints = {k: tuple(v) if isinstance(v, list) else v for k, v in constraints.items()}
 
-    print(f"[SR] Targets: ns={ns_target}±{ns_sigma}, r={r_target}±{r_sigma}, N={N_obs}")
-    print(f"[SR] Ops: {binary_ops} + {unary_ops}, maxsize={maxsize}")
-    print(f"[SR] Evolution: {populations}×{population_size}, {niterations} iters")
+    logger.info("[SR] Targets: ns=%s±%s, r=%s±%s, N=%s", ns_target, ns_sigma, r_target, r_sigma, N_obs)
+    logger.info("[SR] Ops: %s + %s, maxsize=%d", binary_ops, unary_ops, maxsize)
+    logger.info("[SR] Evolution: %d×%d, %d iters", populations, population_size, niterations)
 
     # Load Julia module
     julia_code = JULIA_MODULE.format(
@@ -325,7 +328,7 @@ def _run_pysr(config: dict) -> dict:
         N_obs=N_obs,
     )
     jl.seval(julia_code)
-    print("[SR] Julia module loaded")
+    logger.info("[SR] Julia module loaded")
 
     # Configure PySR
     pysr_config = {
@@ -354,13 +357,13 @@ def _run_pysr(config: dict) -> dict:
         pysr_config["complexity_of_operators"] = config["complexity_of_operators"]
 
     # Run PySR
-    print(f"[SR] Starting (~{niterations // 10} min)...")
+    logger.info("[SR] Starting (~%d min)...", niterations // 10)
     phi = np.linspace(0.001, 25.0, 1000)
     model = PySRRegressor(**pysr_config)
     model.fit(phi.reshape(-1, 1), np.zeros(1000), variable_names=["phi"])
 
     # Verify and collect results
-    print("[SR] Verifying candidates...")
+    logger.info("[SR] Verifying candidates...")
     equations = model.equations_.sort_values("score", ascending=False)
     results = []
 
@@ -395,7 +398,7 @@ def _run_pysr(config: dict) -> dict:
     if not results:
         return {"success": False, "error": "No valid candidates found"}
 
-    print(f"[SR] Found {len(results)} candidates")
+    logger.info("[SR] Found %d candidates", len(results))
     return {"success": True, "num_results": len(results), "results": results}
 
 

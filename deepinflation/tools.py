@@ -98,7 +98,7 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
         phi_plot, V_plot, eps_plot, eta_plot = phi[mask], V[mask], eps[mask], eta[mask]
 
         fig, axes = plt.subplots(1, 3, figsize=(13, 4), layout="constrained")
-        fig.suptitle(f"V(φ) = {expression}", fontsize=11, y=0.98)
+        fig.suptitle(f"V(φ) = {expression}", fontsize=11)
 
         # Panel 1: potential with trajectory markers.
         axes[0].plot(phi_plot, V_plot, linewidth=2, color="#2E86AB", alpha=0.8)
