@@ -56,7 +56,7 @@ def create_agent_interface():
         if not args:
             return ""
 
-        if tool_name == "delegate_task_to_member":
+        if tool_name == "run_sr_agent":
             return f"**Task**: {args.get('task', '')}"
 
         if tool_name in ("analyze_potential", "plot_potential"):

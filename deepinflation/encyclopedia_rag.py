@@ -1,6 +1,7 @@
 """Encyclopedia RAG built directly on OpenAI embeddings and LanceDB."""
 
 import json
+import logging
 from hashlib import md5
 from pathlib import Path
 
@@ -18,14 +19,10 @@ CONFIG_FILE = "embedding_config.json"
 CHUNK_TOKENS = 500
 PARENT_MAX_TOKENS = 5000
 EMBED_BATCH_SIZE = 128
-VERBOSE = True
+
+logger = logging.getLogger(__name__)
 
 _enc = None
-
-
-def _print(*args, **kwargs):
-    if VERBOSE:
-        print(*args, **kwargs)
 
 
 def _tokens(text: str) -> int:
@@ -58,9 +55,9 @@ class EncyclopediaRAG:
         self.parent_store: dict[str, dict] = {}
         self.table = None
 
-        _print("[Encyclopedia] Initializing...")
+        logger.debug("[Encyclopedia] Initializing...")
         self._open_or_build_index()
-        _print(f"[Encyclopedia] Ready ({len(self.parent_store)} parents)")
+        logger.debug("[Encyclopedia] Ready %d parents", len(self.parent_store))
 
     def _open_or_build_index(self) -> None:
         """Reuse an existing index when config matches; otherwise rebuild it."""
@@ -79,14 +76,16 @@ class EncyclopediaRAG:
             self.table = self.db.open_table(TABLE_NAME)
             self.parent_store = saved.get("parent_store", {})
             if self.table.count_rows() > 0 and self.parent_store:
-                _print(f"[Encyclopedia] Loaded {self.table.count_rows()} chunks, {len(self.parent_store)} parents")
+                logger.debug(
+                    "[Encyclopedia] Loaded %d chunks, %d parents", self.table.count_rows(), len(self.parent_store)
+                )
                 return
 
         self._build_index()
 
     def _build_index(self) -> None:
         """Build parent docs, chunk them, embed them, then store the index."""
-        _print("[Encyclopedia] Building index...")
+        logger.debug("[Encyclopedia] Building index...")
 
         metadata_by_model = {}
         if MODEL_LIST_PATH.exists():
@@ -141,7 +140,7 @@ class EncyclopediaRAG:
                         }
                     )
 
-            _print(f"[Encyclopedia] Indexed {model_name}: {len(parents)} parent(s)")
+            logger.debug("[Encyclopedia] Indexed %s: %d parent(s)", model_name, len(parents))
 
         if not rows:
             raise RuntimeError("No encyclopedia documents found to index")
@@ -154,7 +153,7 @@ class EncyclopediaRAG:
             batch = texts[start : start + EMBED_BATCH_SIZE]
             response = self.client.embeddings.create(model=self.embedding_model, input=batch)
             embeddings.extend(item.embedding for item in response.data)
-            _print(f"[Encyclopedia] Embedded {min(start + len(batch), len(texts))}/{len(texts)} chunks")
+            logger.debug("[Encyclopedia] Embedded %d/%d chunks", min(start + len(batch), len(texts)), len(texts))
 
         for row, embedding in zip(rows, embeddings, strict=True):
             row["vector"] = embedding
@@ -178,7 +177,7 @@ class EncyclopediaRAG:
                 ensure_ascii=False,
             )
 
-        _print(f"[Encyclopedia] Built {self.table.count_rows()} chunks")
+        logger.debug("[Encyclopedia] Built %d chunks", self.table.count_rows())
 
     def _split_by_sections(self, content: str, model_name: str) -> list[tuple[str, str]]:
         """Split a large markdown file into parent documents by top-level headings."""

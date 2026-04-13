@@ -9,6 +9,7 @@ Two main tools for analyzing inflation potentials:
 """
 
 import json
+import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -26,13 +27,8 @@ _BK18_DATA = np.load(_BK18_DATA_PATH) if _BK18_DATA_PATH.exists() else None
 _PACT_DATA_PATH = _PROJECT_ROOT / "data/planck_act_posterior.npz"
 _PACT_DATA = np.load(_PACT_DATA_PATH) if _PACT_DATA_PATH.exists() else None
 
-VERBOSE = True
+logger = logging.getLogger(__name__)
 TAB10 = colormaps["tab10"]
-
-
-def _print(*args, **kwargs):
-    if VERBOSE:
-        print(*args, **kwargs)
 
 
 def analyze_potential(expression: str) -> str:
@@ -45,7 +41,7 @@ def analyze_potential(expression: str) -> str:
             Valid: 'phi^2' or 'phi**2', '(1-exp(-sqrt(2/3)*phi))^2'.
             Invalid: 'M*phi^2', 'V0*exp(-phi)'.
     """
-    _print(f"[Analyze] V(φ) = {expression}")
+    logger.debug("[Analyze] V(φ) = %s", expression)
     try:
         trajectories = compute_observables_all_trajectories(expression)
         if not trajectories:
@@ -74,7 +70,7 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
             Invalid: 'V0*phi^2'.
         output_path: Save path (default: './potential_plot.png').
     """
-    _print(f"[Plot] V(φ) = {expression}")
+    logger.debug("[Plot] V(φ) = %s", expression)
     try:
         phi, V, eps, eta = generate_plot_data(expression)
         trajectories_60 = compute_observables_all_trajectories(expression, N=60.0)
@@ -330,7 +326,7 @@ def plot_potential(expression: str, output_path: str = "./potential_plot.png") -
         output_file.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_file, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        _print(f"[Plot] Saved to {output_file.absolute()}")
+        logger.debug("[Plot] Saved to %s", output_file.absolute())
 
         return json.dumps({"success": True, "plot_path": str(output_file.absolute())}, indent=2)
 

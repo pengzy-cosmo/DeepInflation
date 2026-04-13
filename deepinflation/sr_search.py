@@ -5,17 +5,13 @@ each PySR run executes in a fresh process (avoids Julia threading issues).
 """
 
 import json
+import logging
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-VERBOSE = True
-
-
-def _print(*args, **kwargs):
-    if VERBOSE:
-        print(*args, **kwargs)
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -345,7 +341,7 @@ def _run_pysr(config: dict) -> dict:
         "early_stop_condition": "f(loss, complexity) = (loss < 1e-4) && (complexity < 10)",
         "turbo": True,
         "bumper": True,
-        "verbosity": 1 if VERBOSE else 0,
+        "verbosity": 1,
         "progress": True,
     }
     if unary_ops:
@@ -472,7 +468,7 @@ def search_potential(config_json: str) -> str:
                     )
 
     # Run in isolated process
-    _print("[SR] Launching worker process...")
+    logger.debug("[SR] Launching worker process...")
 
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1, mp_context=ctx) as executor:

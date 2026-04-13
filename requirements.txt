@@ -12,8 +12,6 @@ anyio==4.12.0
     #   httpx
     #   openai
     #   starlette
-audioop-lts==0.2.2
-    # via gradio
 brotli==1.2.0
     # via gradio
 certifi==2025.11.12
@@ -231,6 +229,7 @@ typer-slim==0.20.0
     # via huggingface-hub
 typing-extensions==4.15.0
     # via
+    #   anyio
     #   fastapi
     #   gradio
     #   gradio-client
@@ -240,6 +239,7 @@ typing-extensions==4.15.0
     #   pydantic
     #   pydantic-core
     #   pysr
+    #   starlette
     #   typer
     #   typer-slim
     #   typing-inspection
